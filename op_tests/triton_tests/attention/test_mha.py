@@ -124,6 +124,59 @@ def test_mha(
     )
 
 
+# Sliding-window attention (left=window-1, right=0, causal=True) — gpt-oss shape.
+# Covers the wrapper relaxation allowing window_size_right==0 + causal.
+@pytest.mark.parametrize(
+    "SEQLEN_Q, SEQLEN_K, WINDOW",
+    [
+        (128, 128, 128),   # gpt-oss prefill, single block
+        (256, 256, 128),   # window < seqlen, multi-block, n-block-skip exercised
+        (1024, 1024, 128), # long prefill
+        (511, 511, 128),   # non-aligned seqlen
+        (128, 128, 1),     # tightest window (only self+1 prior key)
+    ],
+)
+@pytest.mark.parametrize("NUM_Q_HEADS, NUM_K_HEADS", [(64, 8)])  # gpt-oss GQA
+@pytest.mark.parametrize("HEAD_SZ", [64])  # gpt-oss head_dim
+def test_mha_sliding_window_causal(
+    SEQLEN_Q: int,
+    SEQLEN_K: int,
+    WINDOW: int,
+    NUM_Q_HEADS: int,
+    NUM_K_HEADS: int,
+    HEAD_SZ: int,
+    dtype=torch.bfloat16,
+):
+    from aiter.test_mha_common import attention_ref as _attn_ref
+
+    torch.manual_seed(20)
+    torch.cuda.empty_cache()
+    BATCH = 1
+    q = torch.randn((BATCH, SEQLEN_Q, NUM_Q_HEADS, HEAD_SZ), device="cuda", dtype=dtype)
+    k = torch.randn((BATCH, SEQLEN_K, NUM_K_HEADS, HEAD_SZ), device="cuda", dtype=dtype)
+    v = torch.randn((BATCH, SEQLEN_K, NUM_K_HEADS, HEAD_SZ), device="cuda", dtype=dtype)
+
+    # FA2 contract: window_size=(left, right). gpt-oss uses (sliding_window-1, 0)+causal.
+    window_size = (WINDOW - 1, 0)
+    triton_out = flash_attn_func(
+        q, k, v, dropout_p=0.0, causal=True, window_size=window_size
+    )
+    torch_out, _, _ = _attn_ref(
+        q, k, v, dropout_p=0.0, causal=True, window_size=window_size
+    )
+
+    # cos similarity (double-precision to avoid fp32 1.0+eps artifact)
+    a = triton_out.detach().to(torch.float64).flatten()
+    b = torch_out.detach().to(torch.float64).flatten()
+    cos = (a @ b) / (a.norm() * b.norm() + 1e-30)
+    print(
+        f"[SWA] seqlen={SEQLEN_Q}/{SEQLEN_K} window={WINDOW} "
+        f"cos={cos.item():.8f} max_abs_diff={(triton_out-torch_out).abs().max().item():.3e}"
+    )
+    torch.testing.assert_close(triton_out, torch_out, atol=1e-2, rtol=1e-2)
+    assert cos.item() > 0.9999, f"cos {cos.item()} below 0.9999 threshold"
+
+
 @pytest.mark.parametrize("NUM_Q_HEADS, NUM_K_HEADS", [(1, 1), (8, 1)])
 @pytest.mark.parametrize("DROPOUT, RETURN_LSE, RETURN_SOFTMAX, ", [(0.2, True, True)])
 @pytest.mark.parametrize("CAUSAL", [(True), (False)])
