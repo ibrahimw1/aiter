@@ -77,8 +77,20 @@ def _flash_attn_forward(
 
     if bias is not None:
         raise ValueError("Bias is not supported yet in the Triton Backend")
-    if window_size_right != -1:
-        raise ValueError("window_size_right is not supported yet in the Triton Backend")
+    # Allow window_size_right == 0 only when causal: FA2 contract maps (left, 0)+causal
+    # to allowed key range [q_adj - left, q_adj], which the kernel's SLIDING_WINDOW+IS_CAUSAL
+    # path already implements (see _attn_fwd_inner: k_pos>=q_adj-SLIDING_WINDOW combined with
+    # the IS_CAUSAL k_pos<=q_adj mask). General window_size_right > 0 is still unsupported
+    # (kernel has no symmetric right-edge mask).
+    if window_size_right == 0 and not causal:
+        raise ValueError(
+            "window_size_right == 0 requires causal=True in the Triton Backend "
+            "(non-causal symmetric windowing is not supported)"
+        )
+    if window_size_right != -1 and window_size_right != 0:
+        raise ValueError(
+            "window_size_right > 0 is not supported yet in the Triton Backend"
+        )
     sliding_window = window_size_left if window_size_left >= 0 else 0
 
     # Triton cannot specialize on numpy scalar types; ensure native Python int
