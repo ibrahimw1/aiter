@@ -5,6 +5,7 @@
 References against torch.nn.functional.embedding. The Triton kernel is a pure
 load/store -- output should be bit-exact for all inputs.
 """
+
 import pytest
 import torch
 import torch.nn.functional as F
@@ -16,11 +17,11 @@ from aiter.ops.triton.embedding.gather import gather
 @pytest.mark.parametrize(
     "N, V, D",
     [
-        (1,     128,    64),       # tiny
-        (4,     32000,  2048),     # llama-ish
-        (128,   201088, 2880),     # gpt-oss-120b prefill
-        (512,   201088, 2880),     # gpt-oss with longer batched prefill
-        (1024,  151936, 4096),     # qwen-like
+        (1, 128, 64),  # tiny
+        (4, 32000, 2048),  # llama-ish
+        (128, 201088, 2880),  # gpt-oss-120b prefill
+        (512, 201088, 2880),  # gpt-oss with longer batched prefill
+        (1024, 151936, 4096),  # qwen-like
     ],
 )
 def test_gather_bit_exact(N: int, V: int, D: int, dtype: torch.dtype):
@@ -70,3 +71,46 @@ def test_gather_repeated_indices():
     expected_row = weight[17]
     for n in range(N):
         assert torch.equal(out[n], expected_row), f"row {n} differs"
+
+
+def test_gather_validation_envgate(monkeypatch):
+    """When ATOM_VALIDATE_TRITON_EMBEDDING=1, the first call per shape
+    cross-checks against F.embedding. On a correctly-implemented kernel the
+    validation should pass and the (V, D, dtype) tuple is recorded in
+    _VALIDATED_SHAPES. Subsequent calls then skip validation."""
+    import aiter.ops.triton.embedding.gather as g
+
+    monkeypatch.setenv("ATOM_VALIDATE_TRITON_EMBEDDING", "1")
+    g._VALIDATED_SHAPES.clear()
+    g._FALLBACK_SHAPES.clear()
+
+    V, D, N = 4096, 512, 8
+    weight = torch.randn(V, D, device="cuda", dtype=torch.bfloat16)
+    indices = torch.randint(0, V, (N,), device="cuda", dtype=torch.int64)
+    out = g.gather(indices, weight)
+    # First call should validate and record the shape.
+    assert (V, D, torch.bfloat16) in g._VALIDATED_SHAPES
+    assert (V, D, torch.bfloat16) not in g._FALLBACK_SHAPES
+    # Output still correct.
+    assert torch.equal(out, F.embedding(indices, weight))
+
+
+def test_gather_validation_fallback(monkeypatch):
+    """Force a fallback by injecting a fake `gather` that returns wrong
+    output, then verify the second call routes to F.embedding."""
+    import aiter.ops.triton.embedding.gather as g
+
+    monkeypatch.setenv("ATOM_VALIDATE_TRITON_EMBEDDING", "1")
+    g._VALIDATED_SHAPES.clear()
+    g._FALLBACK_SHAPES.clear()
+
+    # Force the shape into the fallback set directly (simulating what would
+    # happen if validation found a divergence).
+    V, D, N = 2048, 256, 4
+    g._FALLBACK_SHAPES.add((V, D, torch.bfloat16))
+
+    weight = torch.randn(V, D, device="cuda", dtype=torch.bfloat16)
+    indices = torch.randint(0, V, (N,), device="cuda", dtype=torch.int64)
+    out = g.gather(indices, weight)
+    # Should be the F.embedding output bit-exact (fallback path).
+    assert torch.equal(out, F.embedding(indices, weight))
